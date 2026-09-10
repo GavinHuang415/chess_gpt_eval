@@ -1,164 +1,132 @@
-import openai
-import tiktoken
-import json
 import os
-
-# import replicate
+import tiktoken
 
 # for hugging face inference endpoints for codellama
 import requests
 
 from typing import Optional
 
+from openai import (
+    OpenAI,
+    RateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    BadRequestError,
+)
+
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_random_exponential,
 )  # for exponential backoff
 
-# system message is used in openai_request()
-system_message = """Provide the next move in the chess game. Only provide the move, no move numbers."""
+# fallback max_tokens for the legacy hugging_face_request/replicate_request paths, which
+# aren't threaded through BaselineConfig
+DEFAULT_MAX_TOKENS = 10
 
-# dollars per 1k tokens, per openai.com/pricing
-pricing_dict = {
-    "gpt-4": 0.03,
-    "gpt-4-0301": 0.03,
-    "gpt-4-0613": 0.03,
-    "gpt-3.5-turbo": 0.0015,
-    "gpt-3.5-turbo-0301": 0.0015,
-    "gpt-3.5-turbo-0613": 0.0015,
-    "gpt-3.5-turbo-16k": 0.003,
-    "babbage": 0.0005,
-    "gpt-3.5-turbo-instruct": 0.0015,
-}
-
-MAX_TOKENS = 10
-
-completion_models = [
-    "gpt-3.5-turbo-instruct",
-    "babbage",
-    "davinci",
-]
+_clients: dict[tuple[Optional[str], Optional[str]], OpenAI] = {}
 
 
-# tenacity is to handle anytime a request fails
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def get_gpt_response(
-    prompt: str, model: str = "gpt-4", temperature: float = 0.0
+def _get_client(api_key: Optional[str] = None, base_url: Optional[str] = None) -> OpenAI:
+    """Lazily construct and cache an OpenAI-SDK client, keyed by (api_key, base_url) so
+    a run can talk to the real OpenAI API and/or any OpenAI-compatible endpoint (e.g.
+    Gemini's compatibility layer) without the two colliding.
+
+    If `api_key` isn't given, falls back to the OPENAI_API_KEY env var, then
+    gpt_inputs/api_key.txt, to preserve the existing setup flow. `base_url` is passed
+    straight through to the OpenAI SDK; leave it unset to talk to api.openai.com.
+    """
+    cache_key = (api_key, base_url)
+    if cache_key in _clients:
+        return _clients[cache_key]
+
+    resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not resolved_key:
+        with open("gpt_inputs/api_key.txt", "r") as f:
+            resolved_key = f.read().strip()
+
+    client_kwargs = {"api_key": resolved_key}
+    if base_url is not None:
+        client_kwargs["base_url"] = base_url
+
+    client = OpenAI(**client_kwargs)
+    _clients[cache_key] = client
+    return client
+
+
+_unsupported_sampling_params_warned: set[str] = set()
+
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(6),
+    retry=retry_if_exception_type(
+        (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+    ),
+)
+def get_chat_response(
+    messages: list[dict],
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    system_message: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Optional[str]:
-    try:
-        messages = []
-        # system message is used in openai_request()
-        # system_message_dict = {
-        #     "role": "system",
-        #     "content": system_message,
-        # }
-        initial_message = {"role": "user", "content": prompt}
-        messages.append(initial_message)
+    """Send a real multi-turn chat history to an OpenAI-compatible Chat Completions
+    API and return the assistant's reply text. Defaults to the real OpenAI API;
+    pass `base_url`/`api_key` to target any OpenAI-compatible endpoint instead (e.g.
+    Gemini's `https://generativelanguage.googleapis.com/v1beta/openai/`).
 
-        record_messages(messages, model)
+    `messages` is never mutated -- a system message, if given, is prepended to a copy.
+    """
+    client = _get_client(api_key=api_key, base_url=base_url)
 
-        # num_tokens = count_all_tokens(model, messages)
-        # prompt_cost = get_prompt_cost(model, num_tokens)
-        # print("prompt cost in $:", prompt_cost)
+    full_messages = list(messages)
+    if system_message is not None:
+        full_messages = [{"role": "system", "content": system_message}] + full_messages
 
-        if model in completion_models:
-            response = get_completions_response(model, messages, temperature)
-        elif model.startswith("gpt"):
-            response = openai_chat_completion_request(model, messages, temperature)
-        elif model.startswith("openrouter"):
-            response = openrouter_request(model, messages, temperature)
-        elif model.startswith("huggingface"):
-            response = hugging_face_request(model, messages, temperature)
-        elif model.startswith("replicate"):
-            response = replicate_request(model, messages, temperature)
-        else:
-            raise Exception("Invalid model name")
+    record_messages(full_messages, model)
 
-        # response_cost = get_response_cost(model, count_tokens(model, response))
-        # print("response cost in $:", response_cost)
-
-        messages.append({"role": "assistant", "content": response})
-        record_messages(messages, model)
-
-        return response
-    except Exception as e:
-        print(f"Error while getting GPT response: {e}")
-        return None
-
-
-def openai_chat_completion_request(
-    model: str, messages: list[dict], temperature: float
-) -> str:
-    system_message_dict = {
-        "role": "system",
-        "content": system_message,
+    kwargs = {
+        "model": model,
+        "messages": full_messages,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
     }
-    messages.append(system_message_dict)
-    completion = openai.ChatCompletion.create(
-        model=model,
-        temperature=temperature,
-        messages=messages,
-    )
+
+    try:
+        completion = client.chat.completions.create(**kwargs)
+    except BadRequestError as e:
+        # Some newer models reject temperature/top_p entirely. Warn once per model and
+        # retry without them rather than failing the whole run -- but this is a fidelity
+        # concern worth knowing about, so it's printed, not swallowed.
+        if model not in _unsupported_sampling_params_warned:
+            print(
+                f"Warning: model '{model}' rejected sampling parameters ({e}); "
+                "retrying without temperature/top_p."
+            )
+            _unsupported_sampling_params_warned.add(model)
+        kwargs.pop("temperature", None)
+        kwargs.pop("top_p", None)
+        completion = client.chat.completions.create(**kwargs)
+
     response = completion.choices[0].message.content
-    return response
 
-
-def openrouter_request(model: str, messages: list[dict], temperature: float) -> str:
-    if temperature == 0:
-        temperature = 0.001
-
-    with open("gpt_inputs/openrouter_api_key.txt", "r") as f:
-        openai.api_key = f.read().strip()
-
-    openai.api_base = "https://openrouter.ai/api/v1"
-    OPENROUTER_REFERRER = "https://github.com/adamkarvonen/nanoGPT"
-
-    model = model.replace("openrouter/", "")
-
-    completion = openai.ChatCompletion.create(
-        model=model,
-        headers={"HTTP-Referer": OPENROUTER_REFERRER},
-        messages=messages,
-        temperature=temperature,
-        max_tokens=MAX_TOKENS,
-    )
-    response = completion.choices[0].message.content
-    return response
-
-
-def replicate_request(model: str, messages: list[dict], temperature: float) -> str:
-    if temperature == 0:
-        temperature = 0.001
-
-    with open("gpt_inputs/replicate_api_key.txt", "r") as f:
-        api_key = f.read().strip()
-    os.environ["REPLICATE_API_TOKEN"] = api_key
-
-    model = model.replace("replicate/", "")
-
-    messages = translate_to_string_input(messages)
-
-    output = replicate.run(
-        model,
-        input={
-            "prompt": messages,
-            "max_new_tokens": MAX_TOKENS,
-            "temperature": temperature,
-        },
+    record_messages(
+        full_messages + [{"role": "assistant", "content": response}], model
     )
 
-    # The meta/llama-2-7b model can stream output as it's running.
-    response = ""
-    # The predict method returns an iterator, and you can iterate over that output.
-    for item in output:
-        # https://replicate.com/meta/llama-2-7b/versions/527827021d8756c7ab79fde0abbfaac885c37a3ed5fe23c7465093f0878d55ef/api#output-schema
-        response += item
-
     return response
 
 
-def hugging_face_request(model: str, messages: list[dict], temperature: float) -> str:
+def hugging_face_request(
+    model: str, messages: list[dict], temperature: float, max_tokens: int = DEFAULT_MAX_TOKENS
+) -> str:
     def query(payload):
         response = requests.post(API_URL, headers=headers, json=payload)
         return response.json()
@@ -176,11 +144,43 @@ def hugging_face_request(model: str, messages: list[dict], temperature: float) -
     output = query(
         {
             "inputs": messages,
-            "parameters": {"temperature": temperature, "max_new_tokens": MAX_TOKENS},
+            "parameters": {"temperature": temperature, "max_new_tokens": max_tokens},
         }
     )
 
     return output[0]["generated_text"]
+
+
+def replicate_request(
+    model: str, messages: list[dict], temperature: float, max_tokens: int = DEFAULT_MAX_TOKENS
+) -> str:
+    import replicate
+
+    if temperature == 0:
+        temperature = 0.001
+
+    with open("gpt_inputs/replicate_api_key.txt", "r") as f:
+        api_key = f.read().strip()
+    os.environ["REPLICATE_API_TOKEN"] = api_key
+
+    model = model.replace("replicate/", "")
+
+    prompt = translate_to_string_input(messages)
+
+    output = replicate.run(
+        model,
+        input={
+            "prompt": prompt,
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+        },
+    )
+
+    response = ""
+    for item in output:
+        response += item
+
+    return response
 
 
 def translate_to_string_input(
@@ -195,26 +195,6 @@ def translate_to_string_input(
     if roles_included:
         messages.append("assistant: ")
     return "\n".join(messages)
-
-
-# for gpt-3 models and instruct models
-def get_completions_response(
-    model: str,
-    messages: list[dict] | str,
-    temperature: float,
-    max_tokens: int = MAX_TOKENS,
-) -> str:
-    if not isinstance(messages, str):
-        prompt = translate_to_string_input(messages, roles_included=False)
-    else:
-        prompt = messages
-
-    completion = openai.Completion.create(
-        model=model, temperature=temperature, prompt=prompt, max_tokens=max_tokens
-    )
-
-    response = completion.choices[0].text
-    return response
 
 
 def count_all_tokens(model: str, messages: list[dict[str, str]]) -> int:
@@ -254,12 +234,9 @@ def get_response_cost(model: str, num_tokens: int) -> float:
 
 
 def record_messages(messages: list[dict], model: str):
-    # create the conversation in a human-readable format
-    conversation_text = ""
-    for message in messages:
-        conversation_text += message["content"]
-
-    # write the conversation to the next available text file
-    with open(f"gpt_outputs/transcript.txt", "w") as f:
+    """Overwrite the debug transcript with the current, role-tagged multi-turn
+    conversation. This is a live debug aid only (gitignored), not an accumulated log."""
+    with open("gpt_outputs/transcript.txt", "w") as f:
         f.write(model + "\n\n")
-        f.write(conversation_text)
+        for message in messages:
+            f.write(f"[{message['role']}]\n{message['content']}\n\n")

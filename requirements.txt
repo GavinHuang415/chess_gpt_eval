@@ -1,6 +1,6 @@
-openai==0.28.0
-tiktoken==0.4.0
+openai>=1.40,<2
+tiktoken>=0.14.0
 tenacity==8.2.3
-python-chess==1.999
-matplotlib==3.8.0
-pandas==2.1.1
+chess>=1.10
+matplotlib>=3.11.1
+pandas>=2.2.2

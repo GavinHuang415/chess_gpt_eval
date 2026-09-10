@@ -1,34 +1,186 @@
-import openai
 import chess
 import chess.engine
 import os
 import csv
+import json
 import random
+import shutil
+import statistics
+import subprocess
 import time
 import platform
+
+from typing import Optional, Tuple
+from dataclasses import dataclass, field, asdict
 
 # NOTE: LLAMA AND NANOGPT ARE EXPERIMENTAL PLAYERS that most people won't need to use
 # They are commented by default to avoid unnecessary dependencies such as pytorch.
 # from llama_module import BaseLlamaPlayer, LocalLlamaPlayer, LocalLoraLlamaPlayer
 # from nanogpt.nanogpt_module import NanoGptPlayer
 import gpt_query
+from conversation import Conversation
+from baseline_config import BaselineConfig
 
-from typing import Optional, Tuple
-from dataclasses import dataclass
+
+BASELINE_OPENING_MOVES = ("e4", "d4", "Nf3", "e3")
+
+RESIGNATION_TOKENS = ("1-0", "0-1", "1/2-1/2")
+
+MOVE_FIELDNAMES = [
+    "run_id",
+    "game_id",
+    "ply_index",
+    "fullmove_number",
+    "side",
+    "player_label",
+    "move_source",
+    "move_san",
+    "move_uci",
+    "illegal_attempts",
+    "had_illegal",
+    "api_errors",
+    "rejected_responses",
+    "accepted_raw_response",
+    "eval_cp_before_ply",
+    "is_mate_score",
+    "mate_in",
+    "engine_top_moves",
+    "engine_chosen_index",
+    "board_fen_after",
+    "ply_wall_seconds",
+]
+
+GAME_FIELDNAMES = [
+    "run_id",
+    "game_id",
+    "game_index",
+    "model",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_illegal_retries",
+    "engine_depth",
+    "engine_skill_level",
+    "engine_multipv",
+    "opening_move",
+    "result",
+    "termination_reason",
+    "white_score",
+    "black_score",
+    "llm_score",
+    "gl_plies",
+    "gl_fullmoves",
+    "llm_move_count",
+    "llm_illegal_attempts_total",
+    "llm_moves_with_illegal",
+    "imr_final",
+    "rblm_final",
+    "be_move20",
+    "be_final",
+    "be_mean",
+    "llm_api_errors_total",
+    "time_taken",
+    "transcript_san",
+]
+
+
+def choose_opening_move(opening_moves=BASELINE_OPENING_MOVES) -> str:
+    return random.choice(opening_moves)
+
+
+def load_baseline_prompt(path: str) -> str:
+    with open(path, "r") as f:
+        return f.read()
+
+
+def parse_move_from_response(response: Optional[str]) -> Optional[str]:
+    """Strict parsing matching the paper's prompt instruction to reply with only the
+    move: take the first whitespace-delimited token, and strip stray wrapping
+    punctuation some chat models add (backticks, quotes, asterisks, trailing periods).
+    A chatty response counts as illegal, since that's what IMR is meant to measure."""
+    if response is None:
+        return None
+    stripped = response.strip()
+    if not stripped:
+        return None
+    first_token = stripped.split()[0]
+    return first_token.strip("`*\"'.,")
+
+
+def format_movetext(san_by_ply: list[str]) -> str:
+    parts = []
+    for i, san in enumerate(san_by_ply):
+        if i % 2 == 0:
+            parts.append(f"{i // 2 + 1}.")
+        parts.append(san)
+    return " ".join(parts)
+
+
+def generate_unique_game_id() -> str:
+    timestamp = int(time.time())
+    random_num = random.randint(1000, 9999)
+    return f"{timestamp}-{random_num}"
+
+
+def _append_csv_row(path: str, fieldnames: list[str], row: dict) -> None:
+    write_headers = not os.path.exists(path)
+    if not write_headers:
+        with open(path, "r", newline="") as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header is not None and existing_header != fieldnames:
+            raise ValueError(
+                f"{path} has a header that doesn't match the expected schema "
+                f"({existing_header} != {fieldnames}). Use a new run_id or move the "
+                "old file aside."
+            )
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_headers:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _score_from_info(info: dict) -> Tuple[Optional[int], bool, Optional[int]]:
+    score = info.get("score")
+    if score is None:
+        return None, False, None
+    white_score = score.white()
+    if white_score.is_mate():
+        return None, True, white_score.mate()
+    return white_score.score(), False, None
 
 
 @dataclass
-class LegalMoveResponse:
+class LegalMoveResult:
     move_san: Optional[str] = None
     move_uci: Optional[chess.Move] = None
-    attempts: int = 0
+    illegal_attempts: int = 0
+    api_errors: int = 0
+    rejected_responses: list = field(default_factory=list)
+    accepted_raw_response: Optional[str] = None
     is_resignation: bool = False
-    is_illegal_move: bool = False
+    is_illegal_move_limit: bool = False
 
 
-# Define base Player class
+@dataclass
+class EngineDecision:
+    move_san: str
+    move_uci: chess.Move
+    eval_cp: Optional[int]
+    is_mate: bool
+    mate_in: Optional[int]
+    top_moves_san: list
+    chosen_index: int
+
+
 class Player:
-    def get_move(self, board: chess.Board, game_state: str, temperature: float) -> str:
+    def get_move(
+        self,
+        board: chess.Board,
+        conversation: Conversation,
+        temperature: float,
+        top_p: float,
+    ) -> Optional[str]:
         raise NotImplementedError
 
     def get_config(self) -> dict:
@@ -36,16 +188,37 @@ class Player:
 
 
 class GPTPlayer(Player):
-    def __init__(self, model: str):
-        with open("gpt_inputs/api_key.txt", "r") as f:
-            openai.api_key = f.read().strip()
+    def __init__(
+        self,
+        model: str,
+        max_tokens: int = 10,
+        system_message: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
         self.model = model
+        self.max_tokens = max_tokens
+        self.system_message = system_message
+        self.base_url = base_url
+        self.api_key = api_key
 
     def get_move(
-        self, board: chess.Board, game_state: str, temperature: float
+        self,
+        board: chess.Board,
+        conversation: Conversation,
+        temperature: float,
+        top_p: float,
     ) -> Optional[str]:
-        response = get_gpt_response(game_state, self.model, temperature)
-        return get_move_from_gpt_response(response)
+        return gpt_query.get_chat_response(
+            conversation.snapshot(),
+            self.model,
+            temperature,
+            top_p,
+            self.max_tokens,
+            self.system_message,
+            self.base_url,
+            self.api_key,
+        )
 
     def get_config(self) -> dict:
         return {"model": self.model}
@@ -53,478 +226,545 @@ class GPTPlayer(Player):
 
 class StockfishPlayer(Player):
     @staticmethod
-    def get_stockfish_path() -> str:
-        """
-        Determines the operating system and returns the appropriate path for Stockfish.
+    def get_stockfish_path(configured_path: Optional[str] = None) -> str:
+        env_path = os.environ.get("STOCKFISH_PATH")
+        for candidate in (env_path, configured_path):
+            if candidate and os.path.isfile(candidate):
+                return candidate
 
-        Returns:
-            str: Path to the Stockfish executable based on the operating system.
-        """
+        which_path = shutil.which("stockfish") or shutil.which("stockfish.exe")
+        if which_path:
+            return which_path
+
+        default_path = None
         if platform.system() == "Linux":
-            return "/usr/games/stockfish"
-        elif platform.system() == "Darwin":  # Darwin is the system name for macOS
-            return "stockfish"
-        elif platform.system() == "Windows":
-            return (
-                r"C:\Users\adamk\Documents\Stockfish\stockfish-windows-x86-64-avx2.exe"
-            )
-        else:
-            raise OSError("Unsupported operating system")
+            default_path = "/usr/games/stockfish"
+        elif platform.system() == "Darwin":
+            default_path = "stockfish"
 
-    def __init__(self, skill_level: int, play_time: float):
+        if default_path and os.path.isfile(default_path):
+            return default_path
+
+        raise FileNotFoundError(
+            "Could not locate a Stockfish executable. Set the STOCKFISH_PATH "
+            "environment variable (or BaselineConfig.stockfish_path) to its full "
+            "path, or add it to your system PATH. Download Stockfish from "
+            "https://stockfishchess.org/download/"
+        )
+
+    def __init__(
+        self,
+        depth: int = 15,
+        skill_level: Optional[int] = None,
+        multipv: int = 3,
+        stockfish_path: Optional[str] = None,
+    ):
+        self._depth = depth
         self._skill_level = skill_level
-        self._play_time = play_time
-        # If getting started, you need to run brew install stockfish
-        stockfish_path = StockfishPlayer.get_stockfish_path()
-        self._engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        self._multipv = multipv
+        self._limit = chess.engine.Limit(depth=depth)
+
+        path = StockfishPlayer.get_stockfish_path(stockfish_path)
+        self._engine = chess.engine.SimpleEngine.popen_uci(path)
+        self.engine_name = self._engine.id.get("name", "Stockfish")
+
+        if self._skill_level is not None:
+            self._engine.configure({"Skill Level": self._skill_level})
+
+    def analyse_and_select(self, board: chess.Board) -> EngineDecision:
+        """One analyse() call serving both the paper's requirements: the position's
+        eval (from the best line) and a set of up to `multipv` candidate moves, one of
+        which is sampled uniformly at random to actually be played."""
+        infos = self._engine.analyse(board, self._limit, multipv=self._multipv)
+        if isinstance(infos, dict):
+            infos = [infos]
+
+        eval_cp, is_mate, mate_in = _score_from_info(infos[0])
+
+        candidates = [info["pv"][0] for info in infos if info.get("pv")]
+        chosen_index = random.randrange(len(candidates))
+        chosen_move = candidates[chosen_index]
+        move_san = board.san(chosen_move)
+        top_moves_san = [board.san(move) for move in candidates]
+
+        return EngineDecision(
+            move_san=move_san,
+            move_uci=chosen_move,
+            eval_cp=eval_cp,
+            is_mate=is_mate,
+            mate_in=mate_in,
+            top_moves_san=top_moves_san,
+            chosen_index=chosen_index,
+        )
+
+    def evaluate(self, board: chess.Board) -> Tuple[Optional[int], bool, Optional[int]]:
+        info = self._engine.analyse(board, self._limit)
+        return _score_from_info(info)
 
     def get_move(
-        self, board: chess.Board, game_state: str, temperature: float
+        self,
+        board: chess.Board,
+        conversation: Conversation,
+        temperature: float,
+        top_p: float,
     ) -> Optional[str]:
-        if self._skill_level == -2:
-            legal_moves = list(board.legal_moves)
-            random_move = random.choice(legal_moves)
-            return board.san(random_move)
-        elif self._skill_level < 0:
-            self._engine.configure({"Skill Level": 0})
-            result = self._engine.play(
-                board, chess.engine.Limit(time=1e-8, depth=1, nodes=1)
-            )
-
-        else:
-            self._engine.configure({"Skill Level": self._skill_level})
-            result = self._engine.play(board, chess.engine.Limit(time=self._play_time))
-        if result.move is None:
-            return None
-        return board.san(result.move)
+        return self.analyse_and_select(board).move_san
 
     def get_config(self) -> dict:
-        return {"skill_level": self._skill_level, "play_time": self._play_time}
+        return {
+            "engine_name": self.engine_name,
+            "depth": self._depth,
+            "skill_level": self._skill_level,
+        }
 
     def close(self):
         self._engine.quit()
 
 
-def get_gpt_response(game_state: str, model: str, temperature: float) -> Optional[str]:
-    # trying to prevent what I believe to be rate limit issues
-    if model == "gpt-4":
-        time.sleep(0.4)
-    response = gpt_query.get_gpt_response(game_state, model, temperature)
-    return response
-
-
-def get_move_from_gpt_response(response: Optional[str]) -> Optional[str]:
-    if response is None:
-        return None
-
-    # Parse the response to get only the first move
-    moves = response.split()
-    first_move = moves[0] if moves else None
-
-    return first_move
-
-
-def record_results(
+def play_llm_ply(
+    llm_player: GPTPlayer,
     board: chess.Board,
-    player_one: Player,
-    player_two: Player,
-    game_state: str,
-    player_one_illegal_moves: int,
-    player_two_illegal_moves: int,
-    player_one_legal_moves: int,
-    player_two_legal_moves: int,
-    total_time: float,
-    player_one_resignation: bool,
-    player_two_resignation: bool,
-    player_one_failed_to_find_legal_move: bool,
-    player_two_failed_to_find_legal_move: bool,
-    total_moves: int,
-    illegal_moves: int,
-):
-    unique_game_id = generate_unique_game_id()
+    conversation: Conversation,
+    config: BaselineConfig,
+) -> LegalMoveResult:
+    """Repeatedly resample the LLM's move against the SAME conversation history (no
+    escalating temperature, no telling the model its move was illegal -- the paper
+    resamples the turn, it doesn't give feedback) until a legal move is produced or
+    config.max_illegal_retries is exhausted."""
+    illegal_count = 0
+    api_error_count = 0
+    rejected: list[str] = []
 
-    (
-        player_one_title,
-        player_two_title,
-        player_one_time,
-        player_two_time,
-    ) = get_player_titles_and_time(player_one, player_two)
-
-    if player_one_resignation or player_one_failed_to_find_legal_move:
-        result = "0-1"
-        player_one_score = 0
-        player_two_score = 1
-    elif player_two_resignation or player_two_failed_to_find_legal_move:
-        result = "1-0"
-        player_one_score = 1
-        player_two_score = 0
-    else:
-        result = board.result()
-        # Hmmm.... debating this one. Annoying if I leave it running and it fails here for some reason, probably involving some
-        # resignation / failed move situation I didn't think of
-        # -1e10 at least ensures it doesn't fail silently
-        if "-" in result:
-            player_one_score = result.split("-")[0]
-            player_two_score = result.split("-")[1]
-        elif result == "*":  # Draw due to hitting max moves
-            player_one_score = 1 / 2
-            player_two_score = 1 / 2
-        else:
-            player_one_score = -1e10
-            player_two_score = -1e10
-
-    info_dict = {
-        "game_id": unique_game_id,
-        "transcript": game_state,
-        "result": result,
-        "player_one": player_one_title,
-        "player_two": player_two_title,
-        "player_one_time": player_one_time,
-        "player_two_time": player_two_time,
-        "player_one_score": player_one_score,
-        "player_two_score": player_two_score,
-        "player_one_illegal_moves": player_one_illegal_moves,
-        "player_two_illegal_moves": player_two_illegal_moves,
-        "player_one_legal_moves": player_one_legal_moves,
-        "player_two_legal_moves": player_two_legal_moves,
-        "player_one_resignation": player_one_resignation,
-        "player_two_resignation": player_two_resignation,
-        "player_one_failed_to_find_legal_move": player_one_failed_to_find_legal_move,
-        "player_two_failed_to_find_legal_move": player_two_failed_to_find_legal_move,
-        "game_title": f"{player_one_title} vs. {player_two_title}",
-        "number_of_moves": board.fullmove_number,
-        "time_taken": total_time,
-        "total_moves": total_moves,
-        "illegal_moves": illegal_moves,
-    }
-
-    if RUN_FOR_ANALYSIS:
-        csv_file_path = (
-            f"logs/{player_one_recording_name}_vs_{player_two_recording_name}"
-        )
-        csv_file_path = csv_file_path.replace(
-            ".", "_"
-        )  # filenames can't have periods in them. Useful for e.g. gpt-3.5 models
-        csv_file_path += ".csv"
-    else:
-        csv_file_path = recording_file
-
-    # Determine if we need to write headers (in case the file doesn't exist yet)
-    write_headers = not os.path.exists(csv_file_path)
-
-    # Append the results to the CSV file
-    with open(csv_file_path, "a", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=info_dict.keys())
-        if write_headers:
-            writer.writeheader()
-        writer.writerow(info_dict)
-
-    with open("game.txt", "w") as f:
-        f.write(game_state)
-
-
-def generate_unique_game_id() -> str:
-    timestamp = int(time.time())
-    random_num = random.randint(1000, 9999)  # 4-digit random number
-    return f"{timestamp}-{random_num}"
-
-
-def get_player_titles_and_time(
-    player_one: Player, player_two: Player
-) -> Tuple[str, str, Optional[float], Optional[float]]:
-    player_one_config = player_one.get_config()
-    player_two_config = player_two.get_config()
-
-    # For player one
-    if "model" in player_one_config:
-        player_one_title = player_one_config["model"]
-        player_one_time = None
-    else:
-        player_one_title = f"Stockfish {player_one_config['skill_level']}"
-        player_one_time = player_one_config["play_time"]
-
-    # For player two
-    if "model" in player_two_config:
-        player_two_title = player_two_config["model"]
-        player_two_time = None
-    else:
-        player_two_title = f"Stockfish {player_two_config['skill_level']}"
-        player_two_time = player_two_config["play_time"]
-
-    return (player_one_title, player_two_title, player_one_time, player_two_time)
-
-
-def initialize_game_with_opening(
-    game_state: str, board: chess.Board
-) -> Tuple[str, chess.Board]:
-    with open("openings.csv", "r") as file:
-        lines = file.readlines()[1:]  # Skip header
-    moves_string = random.choice(lines)
-    game_state += moves_string
-    # Splitting the moves string on spaces
-    tokens = moves_string.split()
-
-    for token in tokens:
-        # If the token contains a period, it's a move number + move combination
-        if "." in token:
-            move = token.split(".")[-1]  # Take the move part after the period
-        else:
-            move = token
-
-        board.push_san(move)
-    return game_state, board
-
-
-# Return is (move_san, move_uci, attempts, is_resignation, is_illegal_move)
-def get_legal_move(
-    player: Player,
-    board: chess.Board,
-    game_state: str,
-    player_one: bool,
-    max_attempts: int = 5,
-) -> LegalMoveResponse:
-    """Request a move from the player and ensure it's legal."""
-    move_san = None
-    move_uci = None
-
-    for attempt in range(max_attempts):
-        move_san = player.get_move(
-            board, game_state, min(((attempt / max_attempts) * 1) + 0.001, 0.5)
-        )
-
-        # Sometimes when GPT thinks it's the end of the game, it will just output the result
-        # Like "1-0". If so, this really isn't an illegal move, so we'll add a check for that.
-        if move_san is not None:
-            if move_san == "1-0" or move_san == "0-1" or move_san == "1/2-1/2":
-                print(f"{move_san}, player has resigned")
-                return LegalMoveResponse(
-                    move_san=None,
-                    move_uci=None,
-                    attempts=attempt,
-                    is_resignation=True,
-                )
-
+    for _ in range(config.max_illegal_retries):
         try:
-            move_uci = board.parse_san(move_san)
+            response = llm_player.get_move(
+                board, conversation, config.temperature, config.top_p
+            )
         except Exception as e:
-            print(f"Error parsing move {move_san}: {e}")
-            # check if player is gpt-3.5-turbo-instruct
-            # only recording errors for gpt-3.5-turbo-instruct because it's errors are so rare
-            if player.get_config()["model"] == "gpt-3.5-turbo-instruct":
-                with open("gpt-3.5-turbo-instruct-illegal-moves.txt", "a") as f:
-                    f.write(f"{game_state}\n{move_san}\n")
+            print(f"API error while requesting move: {e}")
+            api_error_count += 1
             continue
 
-        if move_uci in board.legal_moves:
-            if not move_san.startswith(" "):
-                move_san = " " + move_san
-            return LegalMoveResponse(move_san, move_uci, attempt)
-        print(f"Illegal move: {move_san}")
+        if response is None:
+            api_error_count += 1
+            continue
 
-    # If we reach here, the player has made illegal moves for all attempts.
-    print(f"{player} provided illegal moves for {max_attempts} attempts.")
-    return LegalMoveResponse(
-        move_san=None, move_uci=None, attempts=max_attempts, is_illegal_move=True
+        move_text = parse_move_from_response(response)
+
+        if move_text in RESIGNATION_TOKENS:
+            return LegalMoveResult(
+                illegal_attempts=illegal_count,
+                api_errors=api_error_count,
+                rejected_responses=rejected,
+                is_resignation=True,
+            )
+
+        move_uci = None
+        if move_text:
+            try:
+                move_uci = board.parse_san(move_text)
+            except Exception:
+                move_uci = None
+
+        if move_uci is not None and move_uci in board.legal_moves:
+            return LegalMoveResult(
+                move_san=board.san(move_uci),
+                move_uci=move_uci,
+                illegal_attempts=illegal_count,
+                api_errors=api_error_count,
+                rejected_responses=rejected,
+                accepted_raw_response=response,
+            )
+
+        illegal_count += 1
+        rejected.append(response)
+        print(f"Illegal move: {move_text!r}")
+
+    return LegalMoveResult(
+        illegal_attempts=illegal_count,
+        api_errors=api_error_count,
+        rejected_responses=rejected,
+        is_illegal_move_limit=True,
     )
 
 
-def play_turn(
-    player: Player, board: chess.Board, game_state: str, player_one: bool
-) -> Tuple[str, bool, bool, int]:
-    result = get_legal_move(player, board, game_state, player_one, 5)
-    illegal_moves = result.attempts
-    move_san = result.move_san
-    move_uci = result.move_uci
-    resignation = result.is_resignation
-    failed_to_find_legal_move = result.is_illegal_move
+def play_baseline_game(
+    config: BaselineConfig,
+    llm_player: GPTPlayer,
+    engine_player: StockfishPlayer,
+    game_index: int,
+    moves_csv_path: str,
+    games_csv_path: str,
+) -> None:
+    board = chess.Board()
+    conversation = Conversation()
+    game_id = generate_unique_game_id()
+    game_start = time.time()
 
-    if resignation:
-        print(f"{player} resigned with result: {board.result()}")
-    elif failed_to_find_legal_move:
-        print(f"Game over: 5 consecutive illegal moves from {player}")
-    elif move_san is None or move_uci is None:
-        print(f"Game over: {player} failed to find a legal move")
-    else:
-        board.push(move_uci)
-        game_state += move_san
-        print(move_san, end=" ")
+    san_by_ply: list[str] = []
+    all_evals: list[int] = []
+    be_by_llm_move: list[Optional[int]] = []
 
-    return game_state, resignation, failed_to_find_legal_move, illegal_moves
+    illegal_attempts_total = 0
+    moves_with_illegal = 0
+    llm_move_count = 0
+    llm_ply_attempts = 0
+    api_errors_total = 0
 
-
-def initialize_game_with_random_moves(
-    board: chess.Board, initial_game_state: str, randomize_opening_moves: int
-) -> tuple[str, chess.Board]:
-    # We loop for multiple attempts because sometimes the random moves will result in a game over
-    MAX_INIT_ATTEMPTS = 5
-    for attempt in range(MAX_INIT_ATTEMPTS):
-        board.reset()  # Reset the board for a new attempt
-        game_state = initial_game_state  # Reset the game state for a new attempt
-        moves = []
-        for moveIdx in range(1, randomize_opening_moves + 1):
-            for player in range(2):
-                moves = list(board.legal_moves)
-                if not moves:
-                    break  # Break if no legal moves are available
-
-                move = random.choice(moves)
-                moveString = board.san(move)
-                if moveIdx > 1 or player == 1:
-                    game_state += " "
-                game_state += (
-                    str(moveIdx) + ". " + moveString if player == 0 else moveString
-                )
-                board.push(move)
-
-            if not moves:
-                break  # Break if no legal moves are available
-
-        if moves:
-            # Successful generation of moves, break out of the attempt loop
-            break
-    else:
-        # If the loop completes without a break, raise an error
-        raise Exception("Failed to initialize the game after maximum attempts.")
-
-    print(game_state)
-    return game_state, board
-
-
-def play_game(
-    player_one: Player,
-    player_two: Player,
-    max_games: int = 10,
-    randomize_opening_moves: Optional[int] = None,
-):
-    # NOTE: I'm being very particular with game_state formatting because I want to match the PGN notation exactly
-    # It looks like this: 1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 etc. HOWEVER, GPT prompts should not end with a trailing whitespace
-    # due to tokenization issues. If you make changes, ensure it still matches the PGN notation exactly.
-    for _ in range(max_games):  # Play 10 games
-        with open("gpt_inputs/prompt.txt", "r") as f:
-            game_state = f.read()
-        board = chess.Board()
-
-        if randomize_opening_moves is not None:
-            game_state, board = initialize_game_with_random_moves(
-                board, game_state, randomize_opening_moves
-            )
-
-        player_one_illegal_moves = 0
-        player_two_illegal_moves = 0
-        player_one_legal_moves = 0
-        player_two_legal_moves = 0
-        player_one_resignation = False
-        player_two_resignation = False
-        player_one_failed_to_find_legal_move = False
-        player_two_failed_to_find_legal_move = False
-        start_time = time.time()
-
-        total_moves = 0
-        illegal_moves = 0
-
-        while not board.is_game_over():
-            with open("game.txt", "w") as f:
-                f.write(game_state)
-            current_move_num = str(board.fullmove_number) + "."
-            total_moves += 1
-            # I increment legal moves here so player_two isn't penalized for the game ending before its turn
-            player_one_legal_moves += 1
-            player_two_legal_moves += 1
-
-            # this if statement may be overkill, just trying to get format to exactly match PGN notation
-            if board.fullmove_number != 1:
-                game_state += " "
-            game_state += current_move_num
-            print(f"{current_move_num}", end="")
-
-            (
-                game_state,
-                player_one_resignation,
-                player_one_failed_to_find_legal_move,
-                illegal_moves_one,
-            ) = play_turn(player_one, board, game_state, player_one=True)
-            player_one_illegal_moves += illegal_moves_one
-            if illegal_moves_one != 0:
-                player_one_legal_moves -= 1
-            if (
-                board.is_game_over()
-                or player_one_resignation
-                or player_one_failed_to_find_legal_move
-            ):
-                break
-
-            (
-                game_state,
-                player_two_resignation,
-                player_two_failed_to_find_legal_move,
-                illegal_moves_two,
-            ) = play_turn(player_two, board, game_state, player_one=False)
-            player_two_illegal_moves += illegal_moves_two
-            if illegal_moves_two != 0:
-                player_two_legal_moves -= 1
-            if (
-                board.is_game_over()
-                or player_two_resignation
-                or player_two_failed_to_find_legal_move
-            ):
-                break
-
-            print("\n", end="")
-
-            if total_moves > MAX_MOVES:
-                break
-
-        end_time = time.time()
-        total_time = end_time - start_time
-        print(f"\nGame over. Total time: {total_time} seconds")
-        print(f"Result: {board.result()}")
-        print(board)
-        print()
-        record_results(
-            board,
-            player_one,
-            player_two,
-            game_state,
-            player_one_illegal_moves,
-            player_two_illegal_moves,
-            player_one_legal_moves,
-            player_two_legal_moves,
-            total_time,
-            player_one_resignation,
-            player_two_resignation,
-            player_one_failed_to_find_legal_move,
-            player_two_failed_to_find_legal_move,
-            total_moves,
-            illegal_moves,
+    def log_ply(
+        ply_index,
+        side,
+        player_label,
+        move_source,
+        move_san,
+        move_uci,
+        illegal_attempts,
+        api_errors,
+        rejected_responses,
+        accepted_raw_response,
+        eval_cp_before_ply,
+        is_mate_score,
+        mate_in,
+        engine_top_moves,
+        engine_chosen_index,
+        ply_wall_seconds,
+    ):
+        _append_csv_row(
+            moves_csv_path,
+            MOVE_FIELDNAMES,
+            {
+                "run_id": config.run_id,
+                "game_id": game_id,
+                "ply_index": ply_index,
+                "fullmove_number": (ply_index + 1) // 2,
+                "side": side,
+                "player_label": player_label,
+                "move_source": move_source,
+                "move_san": move_san or "",
+                "move_uci": move_uci or "",
+                "illegal_attempts": illegal_attempts,
+                "had_illegal": 1 if illegal_attempts > 0 else 0,
+                "api_errors": api_errors,
+                "rejected_responses": " ||| ".join(rejected_responses),
+                "accepted_raw_response": accepted_raw_response or "",
+                "eval_cp_before_ply": eval_cp_before_ply,
+                "is_mate_score": is_mate_score,
+                "mate_in": mate_in,
+                "engine_top_moves": ";".join(engine_top_moves),
+                "engine_chosen_index": (
+                    engine_chosen_index if engine_chosen_index is not None else ""
+                ),
+                "board_fen_after": board.fen(),
+                "ply_wall_seconds": ply_wall_seconds,
+            },
         )
-    if isinstance(player_one, StockfishPlayer):
-        player_one.close()
-    if isinstance(player_two, StockfishPlayer):
-        player_two.close()
 
-        # print(game_state)
+    # Ply 1: White's opening move is forced to one of the paper's 4 options, not
+    # played by the engine.
+    opening_move_san = choose_opening_move(config.opening_moves)
+    eval_before, is_mate, mate_in = engine_player.evaluate(board)
+    opening_move_uci = board.parse_san(opening_move_san)
+    ply_start = time.time()
+    board.push(opening_move_uci)
+    log_ply(
+        1,
+        "white",
+        engine_player.engine_name,
+        "random_opening",
+        opening_move_san,
+        opening_move_uci.uci(),
+        0,
+        0,
+        [],
+        None,
+        eval_before,
+        is_mate,
+        mate_in,
+        [],
+        None,
+        time.time() - ply_start,
+    )
+    san_by_ply.append(opening_move_san)
+    if not is_mate:
+        all_evals.append(eval_before)
+
+    prompt_text = load_baseline_prompt(config.prompt_path).format(
+        first_move=opening_move_san
+    )
+    conversation.add_user(prompt_text)
+
+    ply_index = 1
+    result = "*"
+    termination_reason = "max_plies"
+
+    while ply_index < config.max_plies and not board.is_game_over():
+        # Black to move (the LLM)
+        ply_index += 1
+        eval_before, is_mate, mate_in = engine_player.evaluate(board)
+        ply_start = time.time()
+        llm_result = play_llm_ply(llm_player, board, conversation, config)
+        ply_wall = time.time() - ply_start
+
+        llm_ply_attempts += 1
+        illegal_attempts_total += llm_result.illegal_attempts
+        api_errors_total += llm_result.api_errors
+        if llm_result.illegal_attempts > 0:
+            moves_with_illegal += 1
+
+        if llm_result.is_resignation:
+            termination_reason = "llm_resigned"
+            result = "1-0"
+            log_ply(
+                ply_index,
+                "black",
+                llm_player.model,
+                "llm_resignation",
+                None,
+                None,
+                llm_result.illegal_attempts,
+                llm_result.api_errors,
+                llm_result.rejected_responses,
+                None,
+                eval_before,
+                is_mate,
+                mate_in,
+                [],
+                None,
+                ply_wall,
+            )
+            break
+
+        if llm_result.is_illegal_move_limit:
+            termination_reason = "illegal_move_limit"
+            result = "*"
+            log_ply(
+                ply_index,
+                "black",
+                llm_player.model,
+                "llm_illegal_limit",
+                None,
+                None,
+                llm_result.illegal_attempts,
+                llm_result.api_errors,
+                llm_result.rejected_responses,
+                None,
+                eval_before,
+                is_mate,
+                mate_in,
+                [],
+                None,
+                ply_wall,
+            )
+            break
+
+        board.push(llm_result.move_uci)
+        conversation.add_assistant(llm_result.accepted_raw_response)
+        san_by_ply.append(llm_result.move_san)
+        llm_move_count += 1
+
+        log_ply(
+            ply_index,
+            "black",
+            llm_player.model,
+            "llm",
+            llm_result.move_san,
+            llm_result.move_uci.uci(),
+            llm_result.illegal_attempts,
+            llm_result.api_errors,
+            llm_result.rejected_responses,
+            llm_result.accepted_raw_response,
+            eval_before,
+            is_mate,
+            mate_in,
+            [],
+            None,
+            ply_wall,
+        )
+        if not is_mate:
+            all_evals.append(eval_before)
+
+        be_eval, be_is_mate, _ = engine_player.evaluate(board)
+        be_by_llm_move.append(None if be_is_mate else be_eval)
+
+        if board.is_game_over():
+            termination_reason = board.outcome().termination.name.lower()
+            result = board.result()
+            break
+
+        # White to move (the engine)
+        ply_index += 1
+        ply_start = time.time()
+        decision = engine_player.analyse_and_select(board)
+        board.push(decision.move_uci)
+        conversation.add_user(decision.move_san)
+        san_by_ply.append(decision.move_san)
+        if not decision.is_mate:
+            all_evals.append(decision.eval_cp)
+
+        log_ply(
+            ply_index,
+            "white",
+            engine_player.engine_name,
+            "engine_top3",
+            decision.move_san,
+            decision.move_uci.uci(),
+            0,
+            0,
+            [],
+            None,
+            decision.eval_cp,
+            decision.is_mate,
+            decision.mate_in,
+            decision.top_moves_san,
+            decision.chosen_index,
+            time.time() - ply_start,
+        )
+
+        if board.is_game_over():
+            termination_reason = board.outcome().termination.name.lower()
+            result = board.result()
+            break
+
+    final_eval, final_is_mate, _ = engine_player.evaluate(board)
+    be_final = None if final_is_mate else final_eval
+    be_move20 = be_by_llm_move[19] if len(be_by_llm_move) >= 20 else None
+    be_mean = statistics.mean(all_evals) if all_evals else None
+
+    time_taken = time.time() - game_start
+
+    if result == "1-0":
+        white_score, black_score = 1, 0
+    elif result == "0-1":
+        white_score, black_score = 0, 1
+    elif result == "1/2-1/2":
+        white_score, black_score = 0.5, 0.5
+    else:
+        white_score, black_score = None, None
+    llm_score = black_score
+
+    imr_final = (
+        moves_with_illegal / llm_ply_attempts if llm_ply_attempts else None
+    )
+    rblm_final = (
+        illegal_attempts_total / moves_with_illegal if moves_with_illegal else None
+    )
+
+    record_game(
+        games_csv_path,
+        {
+            "run_id": config.run_id,
+            "game_id": game_id,
+            "game_index": game_index,
+            "model": config.model,
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "max_tokens": config.max_tokens,
+            "max_illegal_retries": config.max_illegal_retries,
+            "engine_depth": config.engine_depth,
+            "engine_skill_level": config.engine_skill_level,
+            "engine_multipv": config.engine_multipv,
+            "opening_move": opening_move_san,
+            "result": result,
+            "termination_reason": termination_reason,
+            "white_score": white_score,
+            "black_score": black_score,
+            "llm_score": llm_score,
+            "gl_plies": len(san_by_ply),
+            "gl_fullmoves": (len(san_by_ply) + 1) // 2,
+            "llm_move_count": llm_move_count,
+            "llm_illegal_attempts_total": illegal_attempts_total,
+            "llm_moves_with_illegal": moves_with_illegal,
+            "imr_final": imr_final,
+            "rblm_final": rblm_final,
+            "be_move20": be_move20,
+            "be_final": be_final,
+            "be_mean": be_mean,
+            "llm_api_errors_total": api_errors_total,
+            "time_taken": time_taken,
+            "transcript_san": format_movetext(san_by_ply),
+        },
+    )
+
+    print(
+        f"Game {game_index}: result={result} termination={termination_reason} "
+        f"plies={len(san_by_ply)} illegal_attempts={illegal_attempts_total}"
+    )
 
 
-NANOGPT = False
-RUN_FOR_ANALYSIS = True
-MAX_MOVES = 1000
-if NANOGPT:
-    MAX_MOVES = 89  # Due to nanogpt max input length of 1024
-recording_file = "logs/determine.csv"  # default recording file. Because we are using list [player_ones], recording_file is overwritten
-player_ones = ["stockfish_16layers_ckpt_no_optimizer.pt"]
-player_ones = ["gpt-3.5-turbo-instruct"]
-player_two_recording_name = "stockfish_sweep"
+def record_game(games_csv_path: str, row: dict) -> None:
+    _append_csv_row(games_csv_path, GAME_FIELDNAMES, row)
+
+
+def _git_commit_hash() -> Optional[str]:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return None
+
+
+def _write_run_config(config: BaselineConfig, path: str, engine_name: str) -> None:
+    payload = asdict(config)
+    if payload.get("api_key"):
+        payload["api_key"] = "<redacted>"
+    payload["opening_moves"] = list(config.opening_moves)
+    payload["stockfish_engine_name"] = engine_name
+    payload["prompt_text"] = load_baseline_prompt(config.prompt_path)
+    payload["git_commit"] = _git_commit_hash()
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def run_baseline_experiment(config: BaselineConfig) -> None:
+    os.makedirs(config.log_dir, exist_ok=True)
+
+    moves_csv_path = os.path.join(config.log_dir, f"{config.run_id}_moves.csv")
+    games_csv_path = os.path.join(config.log_dir, f"{config.run_id}_games.csv")
+    config_json_path = os.path.join(config.log_dir, f"{config.run_id}_config.json")
+
+    llm_player = GPTPlayer(
+        model=config.model,
+        max_tokens=config.max_tokens,
+        system_message=config.system_message,
+        base_url=config.base_url,
+        api_key=config.api_key,
+    )
+    engine_player = StockfishPlayer(
+        depth=config.engine_depth,
+        skill_level=config.engine_skill_level,
+        multipv=config.engine_multipv,
+        stockfish_path=config.stockfish_path,
+    )
+
+    try:
+        _write_run_config(config, config_json_path, engine_player.engine_name)
+        print(f"Run {config.run_id}: {config.num_games} games, model={config.model}")
+
+        for game_index in range(config.num_games):
+            print(f"\n=== Game {game_index + 1}/{config.num_games} ===")
+            play_baseline_game(
+                config, llm_player, engine_player, game_index, moves_csv_path, games_csv_path
+            )
+    finally:
+        engine_player.close()
+
+
 if __name__ == "__main__":
-    for player in player_ones:
-        player_one_recording_name = player
-        for i in range(11):
-            num_games = 100
-            player_one = GPTPlayer(model=player)
-            # player_one = GPTPlayer(model="gpt-4")
-            # player_one = StockfishPlayer(skill_level=-1, play_time=0.1)
-            # player_one = NanoGptPlayer(model_name=player_one_recording_name)
-            player_two = StockfishPlayer(skill_level=i, play_time=0.1)
-            # player_two = GPTPlayer(model="gpt-4")
-            # player_two = GPTPlayer(model="gpt-3.5-turbo-instruct")
-
-            play_game(player_one, player_two, num_games)
+    # This is the single place to configure a baseline run. `model` has no default on
+    # purpose -- set it to whatever chat model you want to evaluate.
+    config = BaselineConfig(
+        model="gemini-flash-lite-latest",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        stockfish_path=r"C:\Users\thelo\Downloads\Misc\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe",
+        # gemini-3.6-flash spends part of its token budget on hidden reasoning before
+        # emitting the move, so the paper's max_tokens=10 (fine for classic chat
+        # models) starves it into an empty response. 300 leaves enough headroom.
+        max_tokens=300,
+        num_games=1,
+    )
+    run_baseline_experiment(config)

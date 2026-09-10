@@ -1,0 +1,2 @@
+I want you to act as a rival chess player. I will start as white, and we will say our moves in reciprocal order. After my first message, I will just write my move. Please don't explain your decision and just reply with your move.
+{first_move}

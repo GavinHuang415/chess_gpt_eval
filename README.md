@@ -1,8 +1,25 @@
 **Overview**
 
-There has recently been some buzz about the ability of GPT-3.5-turbo-instruct's chess playing ability. I wanted to take a more rigourous look and created this repo. With it, you can play two models against each other, whether that's LLM vs Stockfish, LLM vs LLM, or Stockfish vs Stockfish. The primary goal is to test and record the performance of these players against one another in various configurations. Illegal moves, resignations, and game states are all tracked and recorded for later analysis. Per move, a model gets 5 illegal moves before forced resignation of the round.
+There has recently been some buzz about the ability of GPT-3.5-turbo-instruct's chess playing ability. I wanted to take a more rigourous look and created this repo. With it, you can play two models against each other, whether that's LLM vs Stockfish, LLM vs LLM, or Stockfish vs Stockfish. The primary goal is to test and record the performance of these players against one another in various configurations. Illegal moves, resignations, and game states are all tracked and recorded for later analysis.
 
-**Results**
+**Baseline replication**
+
+`main.py`'s `__main__` block runs the baseline procedure from Kuo, Hsueh & Tsai (2023), "Large Language Models on the Chessboard": the LLM plays Black against Stockfish (White), White's opening move is randomly chosen from `{e4, d4, Nf3, e3}`, moves are exchanged as a real multi-turn chat conversation in SAN, Stockfish samples its move from its top 3 candidates each turn (recording its centipawn evaluation of White's advantage along the way), and the LLM gets up to 10 consecutive illegal-move retries (resampled against the same conversation history, not shown its own rejected moves) before the game is terminated.
+
+- Set up:
+  - `pip install -r requirements.txt`.
+  - Put your OpenAI key in `gpt_inputs/api_key.txt`, or set the `OPENAI_API_KEY` environment variable.
+  - Install Stockfish and either put it on your system `PATH`, or point at it explicitly with the `STOCKFISH_PATH` environment variable (or `BaselineConfig.stockfish_path`). On Mac: `brew install stockfish`. On Linux: `apt install stockfish`. On Windows: download a build from [stockfishchess.org](https://stockfishchess.org/download/) and set `STOCKFISH_PATH` to the `.exe` path.
+- Configure and run: edit the `BaselineConfig(...)` at the bottom of `main.py` -- `model` has no default and must be set explicitly (the paper's `gpt-3.5-turbo-0301` is retired). All other run parameters (temperature, top_p, illegal-retry cap, engine search depth, number of games, etc.) live on that same config object. Then run `python main.py`.
+- Output: each run writes three files to `logs/baseline/`, named by `run_id` (defaults to `<model>_<timestamp>`):
+  - `<run_id>_moves.csv` -- one row per ply (move text, illegal-attempt counts, Stockfish's evaluation before that ply, Stockfish's top-3 candidates on its own turns, etc.), appended live so a crashed run keeps its data.
+  - `<run_id>_games.csv` -- one row per game, including the paper's metrics computed at game end: `imr_final`, `rblm_final`, `gl_plies`/`gl_fullmoves`, `be_move20`, `be_final`, `be_mean`.
+  - `<run_id>_config.json` -- full run configuration, prompt text, Stockfish version, and git commit, for provenance.
+- Analysis: `utils/paper_metrics.py` implements the paper's IMR/RBLM/GL/BE formulas against these CSVs; `utils/baseline_analysis.ipynb` is a thin notebook that loads a run and plots the per-move IMR/RBLM curves and the game-length distribution.
+
+**Legacy results (pre-refactor)**
+
+The following results were gathered with the older, non-paper-methodology version of this codebase (LLM as White, best-move-only Stockfish, 5-illegal-move cap, flat-transcript prompting) and are kept here for reference; they are not comparable to `logs/baseline/` output.
 
 GPT-3.5-turbo instruct does well in 150 games against various Stockfish levels and 30 games against GPT-4. Most of gpt-4's losses were due to illegal moves, so it may be possible to come up with a prompt to have gpt-4 correct illegal moves and improve its score.
 
@@ -22,35 +39,13 @@ Standard Deviation of Moves: 21.90
 
 All results were gathered on Stockfish 16 with 0.1 seconds per move on a 2023 M1 Mac. I ran a Stockfish benchmark using `% stockfish bench 1024 16 26 default depth nnue 1>/dev/null 2>stockfish_M1Mac.bench` and stored the output in `logs/stockfish_M1Mac.bench`.
 
-**Setup**
+**Game Recording (legacy path)**
 
-- Install the necessary libraries in `requirements.txt` using pip.
-- Copy paste your OpenAI API key in `gpt_inputs/api_key.txt`.
-- If you plan on using StockfishPlayer, ensure Stockfish is installed on your system and accessible from your system path. On Mac, this is done with `brew install stockfish`. On Linux, you can use `apt install stockfish`.
-
-**Game Recording**
-
-- record_results(): This function logs the game's outcome, various statistics, and game states into a CSV file.
-- The recording file is set based on `player_one_recording_name` and `player_two_recording_name`, which are set at the bottom of `main.py`. For example, if `player_one_recording_name` is `gpt-4` and `player_two_recording_name` is `stockfish_sweep`, the recording file would be `logs/gpt-4_vs_stockfish_sweep.csv`.
-- There is always a transcript of the most recent GPT API call and response in `gpt_outputs/transcript.txt`.
-
-**How to Use**
-
-- Set the desired players by instantiating them at the bottom of `main.py`.
-- As an example, to pit `gpt-3.5-turbo-instruct` against Stockfish level 5 in a match of 15 rounds, do the following before running the program:
-
-```
-num_games = 15
-player_one = GPTPlayer(model="gpt-3.5-turbo-instruct")
-player_two = StockfishPlayer(skill_level=5, play_time=0.1)
-play_game(player_one, player_two, num_games)
-```
-
-- For analysis and graphing purposes, you can check out the contents of `analysis.ipynb`.
+The legacy `record_results()`/`logs/games.csv` path described in earlier versions of this README has been superseded by the baseline-replication logging described above (`logs/baseline/*_games.csv`, `*_moves.csv`); `logs/games.csv` itself is left untouched since its columns have opposite color semantics (LLM was White there).
 
 **Other Capabilities**
 
-There is the ability to run other models using OpenRouter or Hugging Face. However, I've found that other models, like Llama2-70b chat won't provide formatted moves, and Llama2-70b base will hallucinate illegal moves. In addition, it seems like gpt-4 consistently loses to gpt-3.5-turbo-instruct, usually due to forced resignation after 5 illegal moves.
+There is the ability to run other models using Hugging Face inference endpoints or Replicate (see `gpt_query.py`'s `hugging_face_request`/`replicate_request`). However, I've found that other models, like Llama2-70b chat won't provide formatted moves, and Llama2-70b base will hallucinate illegal moves.
 
 You can use Llama and NanoGPT models. For more information, see the READMEs contained in `local_llama/` and `nanogpt/`.
 
