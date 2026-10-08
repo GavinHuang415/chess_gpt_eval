@@ -758,13 +758,13 @@ if __name__ == "__main__":
     # This is the single place to configure a baseline run. `model` has no default on
     # purpose -- set it to whatever chat model you want to evaluate.
     config = BaselineConfig(
-        model="gemini-flash-lite-latest",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        model="gpt-5.6-luna",
+        base_url="https://tritonai-api.ucsd.edu/v1",
         stockfish_path=r"C:\Users\thelo\Downloads\Misc\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe",
         # gemini-3.6-flash spends part of its token budget on hidden reasoning before
         # emitting the move, so the paper's max_tokens=10 (fine for classic chat
         # models) starves it into an empty response. 300 leaves enough headroom.
-        max_tokens=300,
+        max_tokens=4000,
         num_games=1,
     )
     run_baseline_experiment(config)
