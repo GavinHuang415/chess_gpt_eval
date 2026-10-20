@@ -48,6 +48,10 @@ MOVE_FIELDNAMES = [
     "engine_chosen_index",
     "board_fen_after",
     "ply_wall_seconds",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "cost",
 ]
 
 GAME_FIELDNAMES = [
@@ -79,6 +83,10 @@ GAME_FIELDNAMES = [
     "be_final",
     "be_mean",
     "llm_api_errors_total",
+    "llm_prompt_tokens_total",
+    "llm_completion_tokens_total",
+    "llm_reasoning_tokens_total",
+    "llm_cost_total",
     "time_taken",
     "transcript_san",
 ]
@@ -400,6 +408,7 @@ def play_baseline_game(
     conversation = Conversation()
     game_id = generate_unique_game_id()
     game_start = time.time()
+    usage_at_game_start = gpt_query.usage_snapshot()
 
     san_by_ply: list[str] = []
     all_evals: list[int] = []
@@ -428,6 +437,7 @@ def play_baseline_game(
         engine_top_moves,
         engine_chosen_index,
         ply_wall_seconds,
+        usage: Optional[gpt_query.Usage] = None,
     ):
         _append_csv_row(
             moves_csv_path,
@@ -456,6 +466,12 @@ def play_baseline_game(
                 ),
                 "board_fen_after": board.fen(),
                 "ply_wall_seconds": ply_wall_seconds,
+                # Blank on engine plies; covers every attempt on LLM plies, since
+                # resampled illegal moves are billed too.
+                "prompt_tokens": usage.prompt_tokens if usage else "",
+                "completion_tokens": usage.completion_tokens if usage else "",
+                "reasoning_tokens": usage.reasoning_tokens if usage else "",
+                "cost": usage.cost if usage and usage.cost is not None else "",
             },
         )
 
@@ -502,8 +518,10 @@ def play_baseline_game(
         ply_index += 1
         eval_before, is_mate, mate_in = engine_player.evaluate(board)
         ply_start = time.time()
+        usage_before_ply = gpt_query.usage_snapshot()
         llm_result = play_llm_ply(llm_player, board, conversation, config)
         ply_wall = time.time() - ply_start
+        ply_usage = gpt_query.usage_snapshot().since(usage_before_ply)
 
         llm_ply_attempts += 1
         illegal_attempts_total += llm_result.illegal_attempts
@@ -531,6 +549,7 @@ def play_baseline_game(
                 [],
                 None,
                 ply_wall,
+                ply_usage,
             )
             break
 
@@ -554,6 +573,7 @@ def play_baseline_game(
                 [],
                 None,
                 ply_wall,
+                ply_usage,
             )
             break
 
@@ -579,6 +599,7 @@ def play_baseline_game(
             [],
             None,
             ply_wall,
+            ply_usage,
         )
         if not is_mate:
             all_evals.append(eval_before)
@@ -631,6 +652,7 @@ def play_baseline_game(
     be_mean = statistics.mean(all_evals) if all_evals else None
 
     time_taken = time.time() - game_start
+    game_usage = gpt_query.usage_snapshot().since(usage_at_game_start)
 
     if result == "1-0":
         white_score, black_score = 1, 0
@@ -680,6 +702,10 @@ def play_baseline_game(
             "be_final": be_final,
             "be_mean": be_mean,
             "llm_api_errors_total": api_errors_total,
+            "llm_prompt_tokens_total": game_usage.prompt_tokens,
+            "llm_completion_tokens_total": game_usage.completion_tokens,
+            "llm_reasoning_tokens_total": game_usage.reasoning_tokens,
+            "llm_cost_total": game_usage.cost if game_usage.cost is not None else "",
             "time_taken": time_taken,
             "transcript_san": format_movetext(san_by_ply),
         },
@@ -687,7 +713,11 @@ def play_baseline_game(
 
     print(
         f"Game {game_index}: result={result} termination={termination_reason} "
-        f"plies={len(san_by_ply)} illegal_attempts={illegal_attempts_total}"
+        f"plies={len(san_by_ply)} illegal_attempts={illegal_attempts_total} "
+        f"prompt_tokens={game_usage.prompt_tokens} "
+        f"completion_tokens={game_usage.completion_tokens} "
+        f"(reasoning={game_usage.reasoning_tokens}) "
+        f"cost={'not reported' if game_usage.cost is None else f'{game_usage.cost:.6f}'}"
     )
 
 
@@ -758,13 +788,13 @@ if __name__ == "__main__":
     # This is the single place to configure a baseline run. `model` has no default on
     # purpose -- set it to whatever chat model you want to evaluate.
     config = BaselineConfig(
-        model="gpt-5.6-luna",
+        model="claude-opus-5-5",
         base_url="https://tritonai-api.ucsd.edu/v1",
         stockfish_path=r"C:\Users\thelo\Downloads\Misc\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe",
         # gemini-3.6-flash spends part of its token budget on hidden reasoning before
         # emitting the move, so the paper's max_tokens=10 (fine for classic chat
         # models) starves it into an empty response. 300 leaves enough headroom.
-        max_tokens=4000,
+        max_tokens=10000,
         num_games=1,
     )
     run_baseline_experiment(config)
